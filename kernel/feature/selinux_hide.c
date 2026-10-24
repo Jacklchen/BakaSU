@@ -1061,124 +1061,62 @@ out:
 /*
  * Caveat:  Mutates scontext.
  */
-static int string_to_context_struct(struct policydb *pol, struct policydb *orig_pol, struct sidtab *sidtabp,
-                                    struct sidtab *orig_sidtabp, char *scontext, char *orig_scontext, u32 scontext_len,
-                                    struct context *ctx, struct context *orig_ctx, u32 def_sid, int *orig_rc_p)
+static int string_to_context_struct(struct policydb *pol, struct sidtab *sidtabp, char *scontext,
+                                    u32 scontext_len, struct context *ctx, u32 def_sid)
 {
-    struct role_datum *role, *orig_role;
-    struct type_datum *typdatum, *orig_typdatum;
-    struct user_datum *usrdatum, *orig_usrdatum;
-    char *scontextp, *orig_scontextp, *p, *orig_p, oldc, orig_oldc;
-    int rc = 0, orig_rc = 0;
+    struct role_datum *role;
+    struct type_datum *typdatum;
+    struct user_datum *usrdatum;
+    char *scontextp, *p, oldc;
+    int rc = -EINVAL;
 
     context_init(ctx);
-    context_init(orig_ctx);
-
-    /* Parse the security context. */
-
-    orig_rc = rc = -EINVAL;
     scontextp = scontext;
-    orig_scontextp = orig_scontext;
-
-    /* Extract the user. */
     p = scontextp;
-    orig_p = orig_scontextp;
-    while (*p && *p != ':') {
+    while (*p && *p != ':')
         p++;
-        orig_p++;
-    }
-
-    if (*p == 0)
+    if (!*p)
         goto out;
-
-    *orig_p++ = *p++ = 0;
-
+    *p++ = 0;
     usrdatum = symtab_search(&pol->p_users, scontextp);
-    orig_usrdatum = symtab_search(&orig_pol->p_users, orig_scontextp);
     if (!usrdatum)
         goto out;
-
     ctx->user = usrdatum->value;
-    if (orig_usrdatum)
-        orig_ctx->user = orig_usrdatum->value;
 
-    /* Extract role. */
     scontextp = p;
-    orig_scontextp = orig_p;
-    while (*p && *p != ':') {
+    while (*p && *p != ':')
         p++;
-        orig_p++;
-    }
-
-    if (*p == 0)
+    if (!*p)
         goto out;
-
-    *orig_p++ = *p++ = 0;
-
+    *p++ = 0;
     role = symtab_search(&pol->p_roles, scontextp);
-    orig_role = symtab_search(&orig_pol->p_roles, orig_scontextp);
     if (!role)
         goto out;
     ctx->role = role->value;
-    if (orig_role)
-        orig_ctx->role = orig_role->value;
 
-    /* Extract type. */
     scontextp = p;
-    orig_scontextp = orig_p;
-    while (*p && *p != ':') {
+    while (*p && *p != ':')
         p++;
-        orig_p++;
-    }
     oldc = *p;
-    orig_oldc = *orig_p;
-    *orig_p++ = *p++ = 0;
-
+    *p++ = 0;
     typdatum = symtab_search(&pol->p_types, scontextp);
-    orig_typdatum = symtab_search(&orig_pol->p_types, orig_scontextp);
     if (!typdatum || typdatum->attribute)
         goto out;
-
     ctx->type = typdatum->value;
-    if (orig_typdatum && !orig_typdatum->attribute)
-        orig_ctx->type = orig_typdatum->value;
 
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 20, 0) || defined(KSU_COMPAT_HAS_STRICTER_MLS_CONTEXT_TO_SID)
     rc = mls_context_to_sid(pol, oldc, p, ctx, sidtabp, def_sid);
-    orig_rc = mls_context_to_sid(orig_pol, orig_oldc, orig_p, orig_ctx, orig_sidtabp, def_sid);
 #else
     rc = mls_context_to_sid(pol, oldc, &p, ctx, sidtabp, def_sid);
-    if ((p - scontext) < scontext_len) {
-        orig_rc = rc = -EINVAL;
-        goto out;
-    }
-
-    orig_rc = mls_context_to_sid(orig_pol, orig_oldc, &orig_p, orig_ctx, orig_sidtabp, def_sid);
-    if ((orig_p - orig_scontext) < scontext_len) {
-        orig_rc = rc = -EINVAL;
-        goto out;
-    }
+    if (!rc && (p - scontext) < scontext_len)
+        rc = -EINVAL;
 #endif
-    if (rc) {
-        orig_rc = -EINVAL;
+    if (rc)
         goto out;
-    }
-
-    /* Check the validity of the new context. */
-    orig_rc = rc = -EINVAL;
-
-    if (policydb_context_isvalid(pol, ctx)) {
-        rc = 0;
-    }
-    if (policydb_context_isvalid(orig_pol, orig_ctx)) {
-        orig_rc = 0;
-    }
+    rc = policydb_context_isvalid(pol, ctx) ? 0 : -EINVAL;
 out:
     if (rc)
         context_destroy(ctx);
-    if (orig_rc)
-        context_destroy(orig_ctx);
-    *orig_rc_p = orig_rc;
     return rc;
 }
 
@@ -1227,76 +1165,106 @@ static int ksu_security_context_to_sid(struct policydb *orig_policydb, struct si
     struct policydb *policydb, *orig_policydb;
     struct sidtab *sidtab, *orig_sidtab;
 #endif
-    char *scontext2, *scontext3, *str = NULL;
-    struct context context, orig_context;
-    int rc = 0, orig_rc = 0;
-    u32 orig_sid;
+    char backup_stack[128] __aligned(sizeof(long));
+    char live_stack[128] __aligned(sizeof(long));
+    char *backup_context, *live_context = NULL;
+    struct context context;
+    int rc, orig_rc = -EINVAL;
+    u32 orig_sid = SECSID_NULL;
 
-    /* An empty security context is never valid. */
     if (!scontext_len)
         return -EINVAL;
-
-    /* Copy the string to allow changes and ensure a NUL terminator */
-    scontext2 = kmemdup_nul(scontext, scontext_len, gfp_flags);
-    if (!scontext2)
-        return -ENOMEM;
-
-    scontext3 = kmemdup_nul(scontext, scontext_len, gfp_flags);
-    if (!scontext3) {
-        kfree(scontext2);
-        return -ENOMEM;
-    }
-
-    // removed: if (!selinux_initialized())
     *sid = SECSID_NULL;
     if (orig_sid_p)
         *orig_sid_p = SECSID_NULL;
+    if (orig_rc_p)
+        *orig_rc_p = -EINVAL;
 
-        // removed: if (force)
+    if (scontext_len < sizeof(backup_stack)) {
+        backup_context = backup_stack;
+        memcpy(backup_context, scontext, scontext_len);
+        backup_context[scontext_len] = 0;
+    } else {
+        backup_context = kmemdup_nul(scontext, scontext_len, gfp_flags);
+        if (!backup_context)
+            return -ENOMEM;
+    }
+
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 10, 0) || defined(KSU_COMPAT_HAS_SELINUX_POLICY_STRUCT)
-    rcu_read_lock();
-    orig_policy = rcu_dereference(selinux_state.policy);
-    orig_policydb = &orig_policy->policydb;
-    orig_sidtab = orig_policy->sidtab;
     policydb = &policy->policydb;
     sidtab = policy->sidtab;
+    rcu_read_lock();
 #else
     ksu_lock_sepolicy_legacy();
 #endif
-    rc = string_to_context_struct(policydb, orig_policydb, sidtab, orig_sidtab, scontext2, scontext3, scontext_len,
-                                  &context, &orig_context, def_sid, &orig_rc);
+    rc = string_to_context_struct(policydb, sidtab, backup_context, scontext_len, &context, def_sid);
     if (!rc) {
 #ifdef KSU_COMPAT_HAS_CONTEXT_ADD_HASH
         rc = context_add_hash(policydb, &context);
 #endif
         if (!rc)
             rc = sidtab_context_to_sid(sidtab, &context, sid);
-        // rc should not be frozen
         context_destroy(&context);
-        // removed: if (rc == -ESTALE)
-        if (!orig_rc) {
-#ifdef KSU_COMPAT_HAS_CONTEXT_ADD_HASH
-            orig_rc = context_add_hash(orig_policydb, &orig_context);
-#endif
-            if (!orig_rc) {
-                // sync to global sidtab
-                orig_rc = sidtab_context_to_sid(orig_sidtab, &orig_context, &orig_sid);
-                if (orig_sid_p)
-                    *orig_sid_p = orig_sid;
-            }
-            context_destroy(&orig_context);
-        }
     }
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 10, 0) || defined(KSU_COMPAT_HAS_SELINUX_POLICY_STRUCT)
     rcu_read_unlock();
 #else
     ksu_unlock_sepolicy_legacy();
 #endif
+    if (rc)
+        goto out;
+
+    /* A rejected backup context never probes the live policy. */
+    if (scontext_len < sizeof(live_stack)) {
+        live_context = live_stack;
+    } else {
+        live_context = kmalloc(scontext_len + 1, gfp_flags);
+        if (!live_context) {
+            rc = -ENOMEM;
+            goto out;
+        }
+    }
+
+retry_live:
+    memcpy(live_context, scontext, scontext_len);
+    live_context[scontext_len] = 0;
+    orig_sid = SECSID_NULL;
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 10, 0) || defined(KSU_COMPAT_HAS_SELINUX_POLICY_STRUCT)
+    rcu_read_lock();
+    orig_policy = rcu_dereference(selinux_state.policy);
+    orig_policydb = &orig_policy->policydb;
+    orig_sidtab = orig_policy->sidtab;
+#else
+    ksu_lock_sepolicy_legacy();
+#endif
+    orig_rc = string_to_context_struct(orig_policydb, orig_sidtab, live_context, scontext_len,
+                                       &context, def_sid);
+    if (!orig_rc) {
+#ifdef KSU_COMPAT_HAS_CONTEXT_ADD_HASH
+        orig_rc = context_add_hash(orig_policydb, &context);
+#endif
+        if (!orig_rc)
+            orig_rc = sidtab_context_to_sid(orig_sidtab, &context, &orig_sid);
+        context_destroy(&context);
+    }
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 10, 0) || defined(KSU_COMPAT_HAS_SELINUX_POLICY_STRUCT)
+    rcu_read_unlock();
+    if (orig_rc == -ESTALE)
+        goto retry_live;
+#else
+    ksu_unlock_sepolicy_legacy();
+#endif
+out:
+    if (rc)
+        orig_rc = rc;
     if (orig_rc_p)
         *orig_rc_p = orig_rc;
-    kfree(scontext3);
-    kfree(scontext2);
-    kfree(str);
+    if (orig_sid_p)
+        *orig_sid_p = orig_sid;
+    if (live_context && live_context != live_stack)
+        kfree(live_context);
+    if (backup_context != backup_stack)
+        kfree(backup_context);
     return rc;
 }
 
